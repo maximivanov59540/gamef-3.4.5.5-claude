@@ -43,6 +43,10 @@ public class BuildingResourceRouting : MonoBehaviour
     [Tooltip("Количество доставок к одному потребителю перед переключением на следующего (1 = переключать после каждой доставки)")]
     [SerializeField] private int _deliveriesBeforeRotation = 1;
 
+    [Header("Координация Производителей")]
+    [Tooltip("Использовать координацию с другими производителями в сети (избегать дублирования поставок)")]
+    [SerializeField] private bool _enableCoordination = true;
+
     // Счетчик доставок к текущему потребителю
     private int _deliveryCountToCurrentConsumer = 0;
 
@@ -82,6 +86,18 @@ public class BuildingResourceRouting : MonoBehaviour
         }
 
         RefreshRoutes();
+    }
+
+    void OnDestroy()
+    {
+        // ✅ НОВОЕ: Отменяем регистрацию при уничтожении здания
+        if (_enableCoordination && ResourceCoordinator.Instance != null && outputDestination != null)
+        {
+            if (outputDestination is MonoBehaviour consumerMB)
+            {
+                ResourceCoordinator.Instance.UnregisterSupplyRoute(this, consumerMB);
+            }
+        }
     }
     void Update()
     {
@@ -137,6 +153,15 @@ public class BuildingResourceRouting : MonoBehaviour
     /// </summary>
     public void RefreshRoutes()
     {
+        // ✅ НОВОЕ: Отменяем старую регистрацию перед обновлением маршрута
+        if (_enableCoordination && ResourceCoordinator.Instance != null && outputDestination != null)
+        {
+            if (outputDestination is MonoBehaviour oldConsumerMB)
+            {
+                ResourceCoordinator.Instance.UnregisterSupplyRoute(this, oldConsumerMB);
+            }
+        }
+
         // === OUTPUT DESTINATION ===
         if (outputDestinationTransform != null)
         {
@@ -522,6 +547,36 @@ public class BuildingResourceRouting : MonoBehaviour
         }
 
         Debug.Log($"[Routing] {gameObject.name}: Найдено {matchingConsumers.Count} потребителей {producedType}. Проверяю доступность по дорогам...");
+
+        // ✅ НОВОЕ: Фильтруем зарезервированных другими производителями
+        if (_enableCoordination && ResourceCoordinator.Instance != null)
+        {
+            var unreservedConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
+            var reservedConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
+
+            foreach (var consumer in matchingConsumers)
+            {
+                if (ResourceCoordinator.Instance.IsConsumerReserved(consumer, this))
+                {
+                    reservedConsumers.Add(consumer);
+                }
+                else
+                {
+                    unreservedConsumers.Add(consumer);
+                }
+            }
+
+            // Если есть незарезервированные - работаем только с ними
+            if (unreservedConsumers.Count > 0)
+            {
+                Debug.Log($"[Routing] {gameObject.name}: 🎯 Фильтрация координации: {matchingConsumers.Count} всего, {unreservedConsumers.Count} незарезервированных, {reservedConsumers.Count} зарезервированных");
+                matchingConsumers = unreservedConsumers;
+            }
+            else
+            {
+                Debug.Log($"[Routing] {gameObject.name}: ⚠️ Все потребители зарезервированы, выбираю из всех");
+            }
+        }
 
         // 4. Проверяем доступность по дорогам и находим ближайшего
         if (_gridSystem == null || _roadManager == null || _identity == null)
@@ -1000,6 +1055,20 @@ public class BuildingResourceRouting : MonoBehaviour
     /// </summary>
     public void NotifyDeliveryCompleted()
     {
+        // ✅ НОВОЕ: Регистрируем связь в координаторе
+        if (_enableCoordination && outputDestination != null && ResourceCoordinator.Instance != null)
+        {
+            var outputInv = GetComponent<BuildingOutputInventory>();
+            if (outputInv != null)
+            {
+                ResourceType producedType = outputInv.GetProvidedResourceType();
+                if (outputDestination is MonoBehaviour consumerMB)
+                {
+                    ResourceCoordinator.Instance.RegisterSupplyRoute(this, consumerMB, producedType);
+                }
+            }
+        }
+
         if (!_enableRoundRobin || outputDestination == null)
             return;
 
@@ -1027,6 +1096,14 @@ public class BuildingResourceRouting : MonoBehaviour
         if (outputDestinationTransform != null)
         {
             Debug.Log($"[Routing] {gameObject.name}: Output destination задан вручную, rotation отменен");
+            return;
+        }
+
+        // ✅ НОВОЕ: Если включена координация - НЕ переключаемся
+        // Координация сама управляет распределением производителей между потребителями
+        if (_enableCoordination)
+        {
+            Debug.Log($"[Routing] {gameObject.name}: Координация включена, rotation отменен (используем фиксированную связь)");
             return;
         }
 
