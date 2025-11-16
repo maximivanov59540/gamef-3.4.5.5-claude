@@ -36,6 +36,20 @@ public class BuildingResourceRouting : MonoBehaviour
     [Tooltip("Предпочитать прямые поставки к потребителям вместо склада (для Output)")]
     [SerializeField] private bool _preferDirectDelivery = true;
 
+    [Header("Round-Robin Распределение")]
+    [Tooltip("Включить равномерное распределение между потребителями (переключаться после каждых N доставок)")]
+    [SerializeField] private bool _enableRoundRobin = true;
+
+    [Tooltip("Количество доставок к одному потребителю перед переключением на следующего (1 = переключать после каждой доставки)")]
+    [SerializeField] private int _deliveriesBeforeRotation = 1;
+
+    [Header("Координация Производителей")]
+    [Tooltip("Использовать координацию с другими производителями в сети (избегать дублирования поставок)")]
+    [SerializeField] private bool _enableCoordination = true;
+
+    // Счетчик доставок к текущему потребителю
+    private int _deliveryCountToCurrentConsumer = 0;
+
     // Кэшированные интерфейсы
     public IResourceReceiver outputDestination { get; private set; }
     public IResourceProvider inputSource { get; private set; }
@@ -72,6 +86,18 @@ public class BuildingResourceRouting : MonoBehaviour
         }
 
         RefreshRoutes();
+    }
+
+    void OnDestroy()
+    {
+        // ✅ НОВОЕ: Отменяем регистрацию при уничтожении здания
+        if (_enableCoordination && ResourceCoordinator.Instance != null && outputDestination != null)
+        {
+            if (outputDestination is MonoBehaviour consumerMB)
+            {
+                ResourceCoordinator.Instance.UnregisterSupplyRoute(this, consumerMB);
+            }
+        }
     }
     void Update()
     {
@@ -127,6 +153,15 @@ public class BuildingResourceRouting : MonoBehaviour
     /// </summary>
     public void RefreshRoutes()
     {
+        // ✅ НОВОЕ: Отменяем старую регистрацию перед обновлением маршрута
+        if (_enableCoordination && ResourceCoordinator.Instance != null && outputDestination != null)
+        {
+            if (outputDestination is MonoBehaviour oldConsumerMB)
+            {
+                ResourceCoordinator.Instance.UnregisterSupplyRoute(this, oldConsumerMB);
+            }
+        }
+
         // === OUTPUT DESTINATION ===
         if (outputDestinationTransform != null)
         {
@@ -234,6 +269,10 @@ public class BuildingResourceRouting : MonoBehaviour
                 }
             }
         }
+
+        // ✅ НОВОЕ: Сбрасываем счетчик доставок при обновлении маршрутов
+        // Это обеспечивает честный round-robin после переключения
+        _deliveryCountToCurrentConsumer = 0;
     }
     
     /// <summary>
@@ -508,6 +547,36 @@ public class BuildingResourceRouting : MonoBehaviour
         }
 
         Debug.Log($"[Routing] {gameObject.name}: Найдено {matchingConsumers.Count} потребителей {producedType}. Проверяю доступность по дорогам...");
+
+        // ✅ НОВОЕ: Фильтруем зарезервированных другими производителями
+        if (_enableCoordination && ResourceCoordinator.Instance != null)
+        {
+            var unreservedConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
+            var reservedConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
+
+            foreach (var consumer in matchingConsumers)
+            {
+                if (ResourceCoordinator.Instance.IsConsumerReserved(consumer, this))
+                {
+                    reservedConsumers.Add(consumer);
+                }
+                else
+                {
+                    unreservedConsumers.Add(consumer);
+                }
+            }
+
+            // Если есть незарезервированные - работаем только с ними
+            if (unreservedConsumers.Count > 0)
+            {
+                Debug.Log($"[Routing] {gameObject.name}: 🎯 Фильтрация координации: {matchingConsumers.Count} всего, {unreservedConsumers.Count} незарезервированных, {reservedConsumers.Count} зарезервированных");
+                matchingConsumers = unreservedConsumers;
+            }
+            else
+            {
+                Debug.Log($"[Routing] {gameObject.name}: ⚠️ Все потребители зарезервированы, выбираю из всех");
+            }
+        }
 
         // 4. Проверяем доступность по дорогам и находим ближайшего
         if (_gridSystem == null || _roadManager == null || _identity == null)
@@ -978,6 +1047,192 @@ public class BuildingResourceRouting : MonoBehaviour
     public bool HasInputSource()
     {
         return inputSource != null;
+    }
+
+    /// <summary>
+    /// ✅ НОВОЕ: Уведомляет о доставке к текущему потребителю
+    /// Вызывается CartAgent'ом после успешной разгрузки Output
+    /// </summary>
+    public void NotifyDeliveryCompleted()
+    {
+        // ✅ НОВОЕ: Регистрируем связь в координаторе
+        if (_enableCoordination && outputDestination != null && ResourceCoordinator.Instance != null)
+        {
+            var outputInv = GetComponent<BuildingOutputInventory>();
+            if (outputInv != null)
+            {
+                ResourceType producedType = outputInv.GetProvidedResourceType();
+                if (outputDestination is MonoBehaviour consumerMB)
+                {
+                    ResourceCoordinator.Instance.RegisterSupplyRoute(this, consumerMB, producedType);
+                }
+            }
+        }
+
+        if (!_enableRoundRobin || outputDestination == null)
+            return;
+
+        _deliveryCountToCurrentConsumer++;
+
+        Debug.Log($"[Routing] {gameObject.name}: Доставка #{_deliveryCountToCurrentConsumer} к {GetConsumerName(outputDestination)} завершена");
+
+        // Проверяем, пора ли переключаться
+        if (_deliveryCountToCurrentConsumer >= _deliveriesBeforeRotation)
+        {
+            Debug.Log($"[Routing] {gameObject.name}: Достигнут лимит доставок ({_deliveriesBeforeRotation}), переключаюсь на следующего потребителя...");
+            _deliveryCountToCurrentConsumer = 0;
+
+            // Ищем следующего потребителя
+            RotateToNextConsumer();
+        }
+    }
+
+    /// <summary>
+    /// ✅ НОВОЕ: Переключается на следующего доступного потребителя для round-robin
+    /// </summary>
+    private void RotateToNextConsumer()
+    {
+        // Если это не автоматический маршрут (задан вручную), не переключаем
+        if (outputDestinationTransform != null)
+        {
+            Debug.Log($"[Routing] {gameObject.name}: Output destination задан вручную, rotation отменен");
+            return;
+        }
+
+        // ✅ НОВОЕ: Если включена координация - НЕ переключаемся
+        // Координация сама управляет распределением производителей между потребителями
+        if (_enableCoordination)
+        {
+            Debug.Log($"[Routing] {gameObject.name}: Координация включена, rotation отменен (используем фиксированную связь)");
+            return;
+        }
+
+        // Сохраняем текущего потребителя
+        IResourceReceiver currentConsumer = outputDestination;
+
+        // Определяем, какой ресурс мы производим
+        var outputInv = GetComponent<BuildingOutputInventory>();
+        if (outputInv == null)
+        {
+            Debug.LogWarning($"[Routing] {gameObject.name}: Нет BuildingOutputInventory, rotation отменен");
+            return;
+        }
+
+        ResourceType producedType = outputInv.GetProvidedResourceType();
+        if (producedType == ResourceType.None)
+        {
+            Debug.LogWarning($"[Routing] {gameObject.name}: Не производим ничего, rotation отменен");
+            return;
+        }
+
+        // Находим всех потребителей этого ресурса
+        BuildingInputInventory[] allInputs = FindObjectsByType<BuildingInputInventory>(FindObjectsSortMode.None);
+        var matchingConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
+
+        foreach (var input in allInputs)
+        {
+            // Пропускаем себя
+            if (input.gameObject == gameObject)
+                continue;
+
+            // Проверяем, требует ли это здание наш ресурс
+            bool needsOurResource = false;
+            foreach (var slot in input.requiredResources)
+            {
+                if (slot.resourceType == producedType)
+                {
+                    needsOurResource = true;
+                    break;
+                }
+            }
+
+            if (needsOurResource)
+            {
+                matchingConsumers.Add(input);
+            }
+        }
+
+        if (matchingConsumers.Count == 0)
+        {
+            Debug.Log($"[Routing] {gameObject.name}: Нет других потребителей {producedType}, остаюсь с текущим");
+            return;
+        }
+
+        if (matchingConsumers.Count == 1)
+        {
+            Debug.Log($"[Routing] {gameObject.name}: Только один потребитель {producedType}, rotation не требуется");
+            return;
+        }
+
+        // Находим индекс текущего потребителя в списке
+        int currentIndex = -1;
+        for (int i = 0; i < matchingConsumers.Count; i++)
+        {
+            if ((object)matchingConsumers[i] == (object)currentConsumer)
+            {
+                currentIndex = i;
+                break;
+            }
+        }
+
+        // Выбираем следующего потребителя (круговой обход)
+        int nextIndex = (currentIndex + 1) % matchingConsumers.Count;
+        BuildingInputInventory nextConsumer = matchingConsumers[nextIndex];
+
+        // Проверяем, не заполнен ли следующий потребитель
+        float nextFillRatio = GetConsumerFillRatio(nextConsumer, producedType);
+
+        // Если следующий потребитель заполнен >= 95%, ищем незаполненного
+        if (nextFillRatio >= 0.95f)
+        {
+            Debug.Log($"[Routing] {gameObject.name}: Следующий потребитель {nextConsumer.name} заполнен на {nextFillRatio*100:F0}%, ищу незаполненного...");
+
+            bool foundAvailable = false;
+            for (int i = 0; i < matchingConsumers.Count; i++)
+            {
+                int checkIndex = (nextIndex + i) % matchingConsumers.Count;
+                var candidateConsumer = matchingConsumers[checkIndex];
+                float candidateFillRatio = GetConsumerFillRatio(candidateConsumer, producedType);
+
+                if (candidateFillRatio < 0.95f)
+                {
+                    nextConsumer = candidateConsumer;
+                    nextFillRatio = candidateFillRatio;
+                    foundAvailable = true;
+                    Debug.Log($"[Routing] {gameObject.name}: Найден незаполненный потребитель {nextConsumer.name} (заполнение: {nextFillRatio*100:F0}%)");
+                    break;
+                }
+            }
+
+            if (!foundAvailable)
+            {
+                Debug.Log($"[Routing] {gameObject.name}: Все потребители заполнены >= 95%, остаюсь с текущим");
+                return;
+            }
+        }
+
+        // Переключаемся на следующего потребителя
+        outputDestination = nextConsumer;
+        _outputDestinationName = $"{nextConsumer.name} (round-robin)";
+
+        Debug.Log($"[Routing] {gameObject.name}: 🔄 ROTATION: {GetConsumerName(currentConsumer)} → {nextConsumer.name} (заполнение: {nextFillRatio*100:F0}%)");
+
+        // Уведомляем ResourceProducer об изменении маршрута
+        var producer = GetComponent<ResourceProducer>();
+        if (producer != null)
+        {
+            producer.RefreshWarehouseAccess();
+        }
+    }
+
+    /// <summary>
+    /// Вспомогательный метод для получения имени потребителя
+    /// </summary>
+    private string GetConsumerName(IResourceReceiver receiver)
+    {
+        if (receiver == null) return "null";
+        if (receiver is MonoBehaviour mb) return mb.name;
+        return receiver.ToString();
     }
     
     // === ДЕБАГ ===
