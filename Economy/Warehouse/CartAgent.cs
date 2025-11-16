@@ -314,6 +314,12 @@ public class CartAgent : MonoBehaviour
 
         _cargoAmount = 0;
 
+        // ✅ НОВОЕ: Уведомляем BuildingResourceRouting о завершении доставки для round-robin
+        if (_routing != null)
+        {
+            _routing.NotifyDeliveryCompleted();
+        }
+
         // ✅ КЛЮЧЕВОЙ МОМЕНТ: Сразу пытаемся загрузить Input!
         Debug.Log($"[CartAgent] {name}: Output разгружен, пытаюсь загрузить Input...");
         TryLoadInput();
