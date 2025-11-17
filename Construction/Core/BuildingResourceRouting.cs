@@ -548,33 +548,46 @@ public class BuildingResourceRouting : MonoBehaviour
 
         Debug.Log($"[Routing] {gameObject.name}: Найдено {matchingConsumers.Count} потребителей {producedType}. Проверяю доступность по дорогам...");
 
-        // ✅ НОВОЕ: Фильтруем зарезервированных другими производителями
+        // ✅ АДАПТИВНАЯ КООРДИНАЦИЯ: Проверяем соотношение производителей/потребителей
         if (_enableCoordination && ResourceCoordinator.Instance != null)
         {
-            var unreservedConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
-            var reservedConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
+            // Проверяем, нужно ли использовать жесткое резервирование 1:1
+            bool useExclusiveReservation = ResourceCoordinator.Instance.ShouldUseExclusiveReservation(this, producedType);
 
-            foreach (var consumer in matchingConsumers)
+            if (useExclusiveReservation)
             {
-                if (ResourceCoordinator.Instance.IsConsumerReserved(consumer, this))
+                // РЕЖИМ 1:1 - фильтруем зарезервированных (как раньше)
+                var unreservedConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
+                var reservedConsumers = new System.Collections.Generic.List<BuildingInputInventory>();
+
+                foreach (var consumer in matchingConsumers)
                 {
-                    reservedConsumers.Add(consumer);
+                    if (ResourceCoordinator.Instance.IsConsumerReserved(consumer, this))
+                    {
+                        reservedConsumers.Add(consumer);
+                    }
+                    else
+                    {
+                        unreservedConsumers.Add(consumer);
+                    }
+                }
+
+                // Если есть незарезервированные - работаем только с ними
+                if (unreservedConsumers.Count > 0)
+                {
+                    Debug.Log($"[Routing] {gameObject.name}: 🎯 РЕЖИМ 1:1 - Фильтрация: {matchingConsumers.Count} всего, {unreservedConsumers.Count} незарезервированных");
+                    matchingConsumers = unreservedConsumers;
                 }
                 else
                 {
-                    unreservedConsumers.Add(consumer);
+                    Debug.Log($"[Routing] {gameObject.name}: ⚠️ Все потребители зарезервированы, выбираю из всех");
                 }
-            }
-
-            // Если есть незарезервированные - работаем только с ними
-            if (unreservedConsumers.Count > 0)
-            {
-                Debug.Log($"[Routing] {gameObject.name}: 🎯 Фильтрация координации: {matchingConsumers.Count} всего, {unreservedConsumers.Count} незарезервированных, {reservedConsumers.Count} зарезервированных");
-                matchingConsumers = unreservedConsumers;
             }
             else
             {
-                Debug.Log($"[Routing] {gameObject.name}: ⚠️ Все потребители зарезервированы, выбираю из всех");
+                // РЕЖИМ МНОГОПОТОЧНОСТИ - НЕ фильтруем зарезервированных
+                // Производитель может обслуживать нескольких потребителей
+                Debug.Log($"[Routing] {gameObject.name}: 🔄 РЕЖИМ МНОГОПОТОЧНОСТИ - производитель может обслуживать всех {matchingConsumers.Count} потребителей");
             }
         }
 
@@ -1055,7 +1068,7 @@ public class BuildingResourceRouting : MonoBehaviour
     /// </summary>
     public void NotifyDeliveryCompleted()
     {
-        // ✅ НОВОЕ: Регистрируем связь в координаторе
+        // ✅ АДАПТИВНАЯ КООРДИНАЦИЯ: Регистрируем связь в координаторе
         if (_enableCoordination && outputDestination != null && ResourceCoordinator.Instance != null)
         {
             var outputInv = GetComponent<BuildingOutputInventory>();
@@ -1066,9 +1079,37 @@ public class BuildingResourceRouting : MonoBehaviour
                 {
                     ResourceCoordinator.Instance.RegisterSupplyRoute(this, consumerMB, producedType);
                 }
+
+                // Проверяем режим работы
+                bool useExclusiveReservation = ResourceCoordinator.Instance.ShouldUseExclusiveReservation(this, producedType);
+
+                if (!useExclusiveReservation)
+                {
+                    // РЕЖИМ МНОГОПОТОЧНОСТИ - разрешаем rotation
+                    _deliveryCountToCurrentConsumer++;
+                    Debug.Log($"[Routing] {gameObject.name}: РЕЖИМ МНОГОПОТОЧНОСТИ - Доставка #{_deliveryCountToCurrentConsumer} к {GetConsumerName(outputDestination)} завершена");
+
+                    // Проверяем, пора ли переключаться
+                    if (_deliveryCountToCurrentConsumer >= _deliveriesBeforeRotation)
+                    {
+                        Debug.Log($"[Routing] {gameObject.name}: Достигнут лимит доставок ({_deliveriesBeforeRotation}), переключаюсь на следующего потребителя...");
+                        _deliveryCountToCurrentConsumer = 0;
+
+                        // Ищем следующего потребителя
+                        RotateToNextConsumer();
+                    }
+                    return; // Выход из метода
+                }
+                else
+                {
+                    // РЕЖИМ 1:1 - rotation отключен
+                    Debug.Log($"[Routing] {gameObject.name}: РЕЖИМ 1:1 - доставка завершена, rotation отключен");
+                    return; // Выход из метода
+                }
             }
         }
 
+        // Старая логика round-robin (если координация отключена)
         if (!_enableRoundRobin || outputDestination == null)
             return;
 
@@ -1099,10 +1140,35 @@ public class BuildingResourceRouting : MonoBehaviour
             return;
         }
 
-        // ✅ НОВОЕ: Если включена координация - НЕ переключаемся
-        // Координация сама управляет распределением производителей между потребителями
-        if (_enableCoordination)
+        // ✅ АДАПТИВНАЯ КООРДИНАЦИЯ: Проверяем режим работы
+        if (_enableCoordination && ResourceCoordinator.Instance != null)
         {
+            // Определяем тип ресурса
+            var checkOutputInv = GetComponent<BuildingOutputInventory>();
+            if (checkOutputInv != null)
+            {
+                ResourceType checkProducedType = checkOutputInv.GetProvidedResourceType();
+
+                // Проверяем, используем ли мы жесткое резервирование 1:1
+                bool useExclusiveReservation = ResourceCoordinator.Instance.ShouldUseExclusiveReservation(this, checkProducedType);
+
+                if (useExclusiveReservation)
+                {
+                    // РЕЖИМ 1:1 - НЕ переключаемся (фиксированная связь)
+                    Debug.Log($"[Routing] {gameObject.name}: РЕЖИМ 1:1 - rotation отменен (используем фиксированную связь)");
+                    return;
+                }
+                else
+                {
+                    // РЕЖИМ МНОГОПОТОЧНОСТИ - разрешаем rotation
+                    Debug.Log($"[Routing] {gameObject.name}: РЕЖИМ МНОГОПОТОЧНОСТИ - rotation разрешен");
+                    // Продолжаем выполнение rotation
+                }
+            }
+        }
+        else if (_enableCoordination)
+        {
+            // Координация включена, но ResourceCoordinator не найден - используем старую логику
             Debug.Log($"[Routing] {gameObject.name}: Координация включена, rotation отменен (используем фиксированную связь)");
             return;
         }
