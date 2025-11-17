@@ -1144,13 +1144,13 @@ public class BuildingResourceRouting : MonoBehaviour
         if (_enableCoordination && ResourceCoordinator.Instance != null)
         {
             // Определяем тип ресурса
-            var outputInv = GetComponent<BuildingOutputInventory>();
-            if (outputInv != null)
+            var checkOutputInv = GetComponent<BuildingOutputInventory>();
+            if (checkOutputInv != null)
             {
-                ResourceType producedType = outputInv.GetProvidedResourceType();
+                ResourceType checkProducedType = checkOutputInv.GetProvidedResourceType();
 
                 // Проверяем, используем ли мы жесткое резервирование 1:1
-                bool useExclusiveReservation = ResourceCoordinator.Instance.ShouldUseExclusiveReservation(this, producedType);
+                bool useExclusiveReservation = ResourceCoordinator.Instance.ShouldUseExclusiveReservation(this, checkProducedType);
 
                 if (useExclusiveReservation)
                 {
