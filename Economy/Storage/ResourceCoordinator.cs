@@ -274,6 +274,105 @@ public class ResourceCoordinator : MonoBehaviour
     }
 
     /// <summary>
+    /// ✅ НОВОЕ: Определяет, нужно ли использовать жесткое резервирование 1:1 или разрешить многопоточность
+    /// </summary>
+    /// <param name="producer">Производитель, который делает запрос</param>
+    /// <param name="resourceType">Тип ресурса</param>
+    /// <returns>true = использовать жесткое резервирование 1:1, false = разрешить многопоточность</returns>
+    public bool ShouldUseExclusiveReservation(MonoBehaviour producer, ResourceType resourceType)
+    {
+        if (producer == null)
+            return true;
+
+        // Находим всех производителей и потребителей данного ресурса в нашей сети
+        var producers = GetAllProducersInNetwork(producer, resourceType);
+        var consumers = GetAllConsumersInNetwork(producer, resourceType);
+
+        int producerCount = producers.Count;
+        int consumerCount = consumers.Count;
+
+        Debug.Log($"[ResourceCoordinator] Соотношение {resourceType}: {producerCount} производителей, {consumerCount} потребителей");
+
+        // Если производителей >= потребителей → жесткое резервирование 1:1
+        // Пример: 2 рудника, 2 кузницы → каждый рудник обслуживает свою кузницу
+        if (producerCount >= consumerCount)
+        {
+            Debug.Log($"[ResourceCoordinator] {producer.name}: Производителей >= потребителей → жесткое резервирование 1:1");
+            return true;
+        }
+
+        // Если производителей < потребителей → разрешить многопоточность
+        // Пример: 1 рудник, 2 кузницы → рудник может обслуживать обе кузницы
+        Debug.Log($"[ResourceCoordinator] {producer.name}: Производителей < потребителей → многопоточность разрешена");
+        return false;
+    }
+
+    /// <summary>
+    /// ✅ НОВОЕ: Находит всех производителей данного ресурса в той же дорожной сети
+    /// </summary>
+    private List<MonoBehaviour> GetAllProducersInNetwork(MonoBehaviour referenceBuilding, ResourceType resourceType)
+    {
+        var producers = new List<MonoBehaviour>();
+
+        // Находим все здания с BuildingOutputInventory
+        var allOutputs = UnityEngine.Object.FindObjectsByType<BuildingOutputInventory>(FindObjectsSortMode.None);
+
+        foreach (var output in allOutputs)
+        {
+            // Проверяем тип ресурса
+            if (output.GetProvidedResourceType() != resourceType)
+                continue;
+
+            // Проверяем, что в той же дорожной сети
+            if (!AreInSameRoadNetwork(referenceBuilding, output))
+                continue;
+
+            producers.Add(output);
+        }
+
+        return producers;
+    }
+
+    /// <summary>
+    /// ✅ НОВОЕ: Находит всех потребителей данного ресурса в той же дорожной сети
+    /// </summary>
+    private List<MonoBehaviour> GetAllConsumersInNetwork(MonoBehaviour referenceBuilding, ResourceType resourceType)
+    {
+        var consumers = new List<MonoBehaviour>();
+
+        // Находим все здания с BuildingInputInventory
+        var allInputs = UnityEngine.Object.FindObjectsByType<BuildingInputInventory>(FindObjectsSortMode.None);
+
+        foreach (var input in allInputs)
+        {
+            // Проверяем, требует ли это здание данный ресурс
+            bool needsResource = false;
+            if (input.requiredResources != null)
+            {
+                foreach (var slot in input.requiredResources)
+                {
+                    if (slot.resourceType == resourceType)
+                    {
+                        needsResource = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!needsResource)
+                continue;
+
+            // Проверяем, что в той же дорожной сети
+            if (!AreInSameRoadNetwork(referenceBuilding, input))
+                continue;
+
+            consumers.Add(input);
+        }
+
+        return consumers;
+    }
+
+    /// <summary>
     /// Очищает устаревшие связи
     /// </summary>
     private void CleanupStaleRoutes()
